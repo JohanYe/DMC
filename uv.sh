@@ -29,7 +29,8 @@ uv pip install \
     pykdtree \
     ipdb \
     libigl \
-    ninja
+    ninja \
+    fpsample
 
 # open3d - 0.9 won't work, use a compatible version for py3.9
 uv pip install "open3d>=0.17,<0.18"

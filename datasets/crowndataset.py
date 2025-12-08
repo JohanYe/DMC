@@ -10,35 +10,56 @@ from os import listdir
 import logging
 import copy
 from models.PoinTr import fps
+import json
+from SAP.src.dpsr import DPSR
+import fpsample
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 @DATASETS.register_module()
 class crown(data.Dataset):
     def __init__(self, config):
         self.data_root = config.DATA_PATH
-        self.pc_path = config.PC_PATH
         self.subset = config.subset
         self.npoints = config.N_POINTS
-        self.data_list_file = os.path.join(self.data_root, f'{self.subset}.txt')
+        self.data_list_file = os.path.join(self.data_root, f"{self.subset}.json")
 
-        print(f'[DATASET] Open file {self.data_list_file}')
-        with open(self.data_list_file, 'r') as f:
-            lines = f.readlines()
+        print(f"[DATASET] Open file {self.data_list_file}")
+        with open(self.data_list_file, "r") as f:
+            data_subset = json.load(f)
 
         self.file_list = []
-        for line in lines:
-            line = line.strip()
-            tax_id = line
-            if 'Lower' in tax_id:
-                taxonomy_id = '0'
-            else:
-                taxonomy_id = '1'
-            self.file_list.append({
-                'taxonomy_id': taxonomy_id,
-                'model_id': tax_id,
-                'file_path': line
-            })
-        print(f'[DATASET] {len(self.file_list)} instances were loaded')
+        for sample in data_subset:
+            file_path = os.path.join(
+                self.data_root, "DataSamples", sample, "DataFiles/"
+            )
+            self.file_list.append(
+                {
+                    "taxonomy_id": "1",  # we only have upper jaws
+                    "model_id": sample,
+                    "file_path": file_path,
+                }
+            )
+        self.dpsr = DPSR(res=(128, 128, 128), sig=2)
+
+    def _compute_psr_for_sample(self, shell_points, shell_normals):
+        """Compute PSR grid from already mean/std normalized shell points"""
+        verts = shell_points.astype(np.float32)
+        norms = shell_normals.astype(np.float32)
+
+        # Scale normalized points to [0.1, 0.9] for DPSR
+        verts_min = verts.min(axis=0)
+        verts_max = verts.max(axis=0)
+        verts_01 = (verts - verts_min) / (verts_max - verts_min + 1e-8)
+        verts_01 = verts_01 * 0.8 + 0.1
+
+        points = torch.from_numpy(verts_01).float().unsqueeze(0)
+        normals = torch.from_numpy(norms).float().unsqueeze(0)
+
+        with torch.no_grad():
+            psr_grid = self.dpsr(points, normals)
+        return psr_grid.squeeze().numpy()
 
     def pc_norm(self, pc):
         centroid = np.mean(pc, axis=0)
@@ -53,10 +74,13 @@ class crown(data.Dataset):
         new_crown = copy.deepcopy(shell)
         # new_marginline = copy.deepcopy(marginline)
 
-        context_mean, context_std = np.mean(np.concatenate((main.points, opposing.points), axis=0), axis=0), \
-                                    np.std(np.concatenate((main.points, opposing.points), axis=0), axis=0)
+        context_mean, context_std = np.mean(
+            np.concatenate((main.points, opposing.points), axis=0), axis=0
+        ), np.std(np.concatenate((main.points, opposing.points), axis=0), axis=0)
         # scale values
-        new_context_points = (np.asarray(new_context.points) - context_mean) / context_std
+        new_context_points = (
+            np.asarray(new_context.points) - context_mean
+        ) / context_std
         # new_context.points = o3d.utility.Vector3dVector(new_context_points)
 
         # final_context = copy.deepcopy(new_context)
@@ -68,7 +92,13 @@ class crown(data.Dataset):
         # new_crown.points = o3d.utility.Vector3dVector(new_crown_points)
         # new_marginline_points = (np.asarray(marginline.points) - context_mean) / context_std
 
-        return new_context_points, new_opposing_points, new_crown_points, context_mean, context_std
+        return (
+            new_context_points,
+            new_opposing_points,
+            new_crown_points,
+            context_mean,
+            context_std,
+        )
 
     def __getitem__(self, idx):
 
@@ -76,42 +106,86 @@ class crown(data.Dataset):
         sample = self.file_list[idx]
         # print(sample['file_path'])
 
-        for j in os.listdir(os.path.join(self.pc_path, sample['file_path'])):
-            if 'Antagonist' in j:
-                opposing = o3d.io.read_point_cloud(os.path.join(self.pc_path, sample['file_path'], j))
-                # o3d.visualization.draw_geometries([opposing])
-            if 'master' in j:
-                main = o3d.io.read_point_cloud(os.path.join(self.pc_path, sample['file_path'], j))
-                # o3d.visualization.draw_geometries([master])
+        with open(
+            os.path.join(
+                sample["file_path"],
+                "input_points.dat",
+            ),
+            "rb",
+        ) as f:
+            input_pc = np.fromfile(f, dtype=np.float32).reshape(
+                -1, 6
+            )  # (x, y, z, nx, ny, nz)
 
-            if 'shell' in j:
-                shell = o3d.io.read_point_cloud(os.path.join(self.pc_path, sample['file_path'], j))
-                shellP = np.asarray(shell.points)
-                shell_min = np.min(shellP)
-                shell_max = np.max(shellP)
-            # else:
-            #   print('there is no shell wih this name',sample['file_path'])
-            # if 'groundTruthMarginLine' in j:
-            # marginline= o3d.io.read_point_cloud(os.path.join(self.pc_path, sample['file_path'], j))
-            # o3d.visualization.draw_geometries([shell])
-            if 'psr' in j:
-                shell_grid = np.load(os.path.join(self.pc_path, sample['file_path'], j))
-                psr = shell_grid['psr']
-                shell_grid = psr.astype(np.float32)
-            # else:
-            # print('there is no psr wih this name',sample['file_path'])
+        with open(
+            os.path.join(
+                sample["file_path"],
+                "input_properties.dat",
+            ),
+            "rb",
+        ) as f:
+            # (diff to prep/antagonist, upper/lower jaw, jawSegmentKind)
+            # 0-dim: diff to prep/antagonist: 0 = antagonist / prep, 1 = unn4, -1 = unn2 or whatever on the other side
+            # 1-dim: upper/lower jaw: 0 = upper jaw, 1 = lower jaw
+            # 2-dim: jawSegmentKind: 0 = natural tooth, 1 = crown/prep
+            input_properties = np.fromfile(f, dtype=np.byte)
+            input_properties = input_properties.reshape(-1, 3)
 
+        # oppposing = antagonist
+        opposing = o3d.geometry.PointCloud()
+        opposing_input = input_pc[input_properties[:, 1] == 1]
+        fps_index = fpsample.bucket_fps_kdline_sampling(
+            opposing_input[:, :3], self.npoints, h=5
+        )
+        opposing_input = opposing_input[fps_index]
+        opposing.points = o3d.utility.Vector3dVector(opposing_input[:, :3])
+        opposing.normals = o3d.utility.Vector3dVector(opposing_input[:, 3:6])
 
+        # main = upper jaw
+        main = o3d.geometry.PointCloud()
+        main_input = input_pc[input_properties[:, 1] == 0]
+        fps_index = fpsample.bucket_fps_kdline_sampling(
+            main_input[:, :3], self.npoints, h=5
+        )
+        main_input = main_input[fps_index]
+        main.points = o3d.utility.Vector3dVector(main_input[:, :3])
+        main.normals = o3d.utility.Vector3dVector(main_input[:, 3:6])
 
+        shell = self.file_list[idx].get("shell_pc")
+        if shell is None:
+            shell_path = os.path.join(sample["file_path"], "outer_crown.ply")
+            mesh = o3d.io.read_triangle_mesh(shell_path)
+            mesh.compute_vertex_normals()  # in case normals aren't stored in the file
+            shell_points = np.asarray(mesh.vertices)
+            shell_normals = np.asarray(mesh.vertex_normals)
+            # fps_index = fpsample.bucket_fps_kdline_sampling(
+            #     shell_points, 3000, h=5
+            # )
+            # shell_points = shell_points[fps_index]
+            # shell_normals = shell_normals[fps_index]
+            shell = o3d.geometry.PointCloud()
+            shell.points = o3d.utility.Vector3dVector(shell_points)
+            shell.normals = o3d.utility.Vector3dVector(shell_normals)
+            self.file_list[idx]["shell_pc"] = shell
 
+        shellP = np.asarray(shell.points)
+        shell_min = np.min(shellP)
+        shell_max = np.max(shellP)
 
-        # normalizie
-        try:
-            main_only, opposing_only, shell = copy.deepcopy(main), copy.deepcopy(opposing), copy.deepcopy(shell)
-        except:
-            print(sample['file_path'])
-        main_only, opposing_only, shell, centroid, std_pc = self.normalize_points_mean_std(main_only, opposing_only,shell)
+        shell_grid = self.file_list[idx].get("psr_grid")
+        if shell_grid is None:
+            shell_grid = self._compute_psr_for_sample(shellP, np.asarray(shell.normals))
+            self.file_list[idx]["psr_grid"] = shell_grid
 
+        # normalize
+        main_only, opposing_only, shell = (
+            copy.deepcopy(main),
+            copy.deepcopy(opposing),
+            copy.deepcopy(shell),
+        )
+        main_only, opposing_only, shell, centroid, std_pc = (
+            self.normalize_points_mean_std(main_only, opposing_only, shell)
+        )
 
         """""
         # sample from main
@@ -146,7 +220,7 @@ class crown(data.Dataset):
         shell_select = np.zeros([patch_size_shell, shell.shape[1]], dtype='float32')
         shell_select[:] = shell[positive_selected_shell_idx, :]
 
-        """""
+        """ ""
         """""
         # sample from marginline
        
@@ -159,15 +233,12 @@ class crown(data.Dataset):
         marginline_only_select = np.zeros([patch_size_margin, marginline_only.shape[1]], dtype='float32')
         marginline_only_select[:] = marginline_only[positive_selected_margin_idx, :]
         
-        """""
+        """ ""
 
+        # shell= open3d.geometry.sample_points_uniformly(shell, number_of_points=2048)
+        # opposing_only= open3d.geometry.sample_points_uniformly(opposing_only, number_of_points=5120)
+        # main_only= open3d.geometry.sample_points_uniformly(main_only, number_of_points=5120)
 
-        
-        #shell= open3d.geometry.sample_points_uniformly(shell, number_of_points=2048)
-        #opposing_only= open3d.geometry.sample_points_uniformly(opposing_only, number_of_points=5120)
-        #main_only= open3d.geometry.sample_points_uniformly(main_only, number_of_points=5120)
-
-        
         # save through dataloader
         # X_train=np.multiply(shell_select,std_pc)+centroid
         # X_train_partial=np.multiply(main_only_select,std_pc)+centroid
@@ -183,8 +254,10 @@ class crown(data.Dataset):
         master_pc = torch.from_numpy(main_only).float().unsqueeze(0)
         master_sample = fps(master_pc, 5120,device)
         #data_partial = torch.concat((master_sample.squeeze(0), antag_sample.squeeze(0)))
-        """""
-        data_partial = torch.from_numpy(np.concatenate((main_only, opposing_only), axis=0)).float()
+        """ ""
+        data_partial = torch.from_numpy(
+            np.concatenate((main_only, opposing_only), axis=0)
+        ).float()
         data_gt = torch.from_numpy(shell).float()
         min_gt = torch.from_numpy(np.asarray(shell_min)).float()
         max_gt = torch.from_numpy(np.asarray(shell_max)).float()
@@ -192,7 +265,17 @@ class crown(data.Dataset):
         value_std_pc = torch.from_numpy(std_pc).float()
         shell_grid_gt = torch.from_numpy(np.asarray(shell_grid)).float()
 
-        return sample['taxonomy_id'], sample['model_id'], data_gt, data_partial, value_centroid, value_std_pc, shell_grid_gt, min_gt, max_gt
+        return (
+            sample["taxonomy_id"],
+            sample["model_id"],
+            data_gt,
+            data_partial,
+            value_centroid,
+            value_std_pc,
+            shell_grid_gt,
+            min_gt,
+            max_gt,
+        )
 
     def __len__(self):
         return len(self.file_list)

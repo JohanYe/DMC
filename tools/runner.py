@@ -14,8 +14,9 @@ from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 from pytorch3d.loss import chamfer_distance
 from SAP.src.model import PSR2Mesh
 from collections import defaultdict
-from SAP.src.model import Encode2Points
 from SAP.src.utils import *
+import trimesh
+from datetime import datetime
 
 
 def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
@@ -137,8 +138,8 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             psr_grid, point_r = base_model(
                 partial, min_gt, max_gt, value_std_pc, value_centroid
             )
-            psr_grid = torch.tanh(psr_grid)
-            gt_psr = torch.tanh(gt_psr)
+            psr_grid = torch.tanh(torch.clamp(psr_grid, -10, 10))
+            gt_psr = torch.tanh(torch.clamp(gt_psr, -10, 10))
             # loss_each = {}
             #
             loss_chamfer = base_model.module.get_loss(point_r, gt)
@@ -146,6 +147,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
 
             loss_mse = criterion(psr_grid, gt_psr)
             loss = loss_mse + loss_chamfer
+            loss = loss / config.step_per_update
 
             loss.backward()
             # optimizer.step()
@@ -153,6 +155,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             # forward
             if num_iter == config.step_per_update:
                 num_iter = 0
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
                 optimizer.step()
                 base_model.zero_grad()
             logger.info("loss metric : %.4f" % (loss))
@@ -279,8 +282,8 @@ def validate(
             # print("psr_grid_valid", psr_grid)
             # print("point_r_valid", point_r)
 
-            psr_grid = torch.tanh(psr_grid)
-            gt_psr = torch.tanh(gt_psr)
+            psr_grid = torch.tanh(torch.clamp(psr_grid, -10, 10))
+            gt_psr = torch.tanh(torch.clamp(gt_psr, -10, 10))
             loss_chamfer = base_model.module.get_loss(point_r, gt)
             # loss_chamfer, _ = chamfer_distance(point_r, gt)
 
@@ -299,7 +302,39 @@ def validate(
             logger.info("Validation metric : %.4f" % (metric_val))
 
             if val_writer is not None:
-                val_writer.add_scalar("Valid/epoch", loss, epoch)
+                val_writer.add_scalar(
+                    "Valid/loss_chamfer", loss_chamfer.item(), epoch * n_samples + idx
+                )
+                val_writer.add_scalar(
+                    "Valid/loss_mse", loss_mse.item(), epoch * n_samples + idx
+                )
+                val_writer.add_scalar(
+                    "Valid/total_loss", loss.item(), epoch * n_samples + idx
+                )
+
+            if idx < 3:
+                vis_dir = os.path.join(args.experiment_path, "vis")
+                os.makedirs(vis_dir, exist_ok=True)
+
+                # Denormalize points
+                pred_points = (
+                    point_r[0].cpu().numpy() * value_std_pc.numpy()
+                ) + value_centroid.numpy()
+                gt_points = (
+                    gt[0].cpu().numpy() * value_std_pc.numpy()
+                ) + value_centroid.numpy()
+
+                # Save as PLY
+                trimesh.PointCloud(pred_points).export(
+                    os.path.join(vis_dir, f"epoch{epoch:03d}_sample{idx}_pred.ply")
+                )
+                trimesh.PointCloud(gt_points).export(
+                    os.path.join(vis_dir, f"epoch{epoch:03d}_sample{idx}_gt.ply")
+                )
+
+    if val_writer is not None:
+        val_writer.add_scalar("Valid/epoch_loss_mse", eval_dict["psr_l2"], epoch)
+        val_writer.add_scalar("Valid/epoch_loss_chamfer", eval_dict["psr_l1"], epoch)
 
     return metric_val
 
@@ -400,6 +435,8 @@ def test(
                     os.path.join(point_dir, str(model_id) + "pred.npy"),
                     dense_points.cpu().numpy(),
                 )
+                pc = trimesh.PointCloud(dense_points.cpu().numpy())
+                pc.export(os.path.join(point_dir, str(model_id) + "pred.ply"))
 
                 min_gt = dense_points.min()
                 max_gt = dense_points.max()
