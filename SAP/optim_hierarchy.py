@@ -31,20 +31,20 @@ def main():
             psr_sigma = 5 if 'thingi_noisy' in args.config else 3
 
         if args.object_id != -1:
-            out_dir = os.path.join(cfg['train']['out_dir'], 'object_%02d'%args.object_id, 'res_%d'%res)
+            out_dir = os.path.join(cfg['training']['out_dir'], 'object_%02d'%args.object_id, 'res_%d'%res)
         else:
-            out_dir = os.path.join(cfg['train']['out_dir'], 'res_%d'%res)
+            out_dir = os.path.join(cfg['training']['out_dir'], 'res_%d'%res)
         
         # sample from mesh when resampling is enabled, otherwise reuse the pointcloud
-        init_shape='mesh' if cfg['train']['resample_every']>0 else 'pointcloud'
+        init_shape='mesh' if cfg['training']['resample_every']>0 else 'pointcloud'
                 
         
         if args.object_id != -1:
-            input_mesh='None' if idx==0 else os.path.join(cfg['train']['out_dir'], 
+            input_mesh='None' if idx==0 else os.path.join(cfg['training']['out_dir'], 
                             'object_%02d'%args.object_id, 'res_%d' % (resolutions[idx-1]), 
                             'vis', init_shape, '%04d.ply' % (iterations[idx-1]))
         else:
-            input_mesh='None' if idx==0 else os.path.join(cfg['train']['out_dir'],
+            input_mesh='None' if idx==0 else os.path.join(cfg['training']['out_dir'],
                             'res_%d' % (resolutions[idx-1]), 
                             'vis', init_shape, '%04d.ply' % (iterations[idx-1]))
         
