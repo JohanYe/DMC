@@ -120,6 +120,10 @@ class PoinTr(nn.Module):
         self.reduce_map = nn.Linear(self.trans_dim + 1027, self.trans_dim)
         self.build_loss_func()
 
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm1d):
+                module.momentum = 0.01
+
     def build_loss_func(self):
         self.loss_func = ChamferDistanceL1()
 
@@ -162,15 +166,18 @@ class PoinTr(nn.Module):
         # inp_sparse = fps(xyz, self.num_query)
 
         # denormalize the data based on mean and std
-        value_std_points = value_std_pc.view((rebuild_points.shape[0], 1, 3))
-        value_centroid_points = value_centroid.view((rebuild_points.shape[0], 1, 3))
+        device = rebuild_points.device
+        value_std_points = value_std_pc.to(device).view((rebuild_points.shape[0], 1, 3))
+        value_centroid_points = value_centroid.to(device).view(
+            (rebuild_points.shape[0], 1, 3)
+        )
         De_point = (
             torch.multiply(rebuild_points, value_std_points) + value_centroid_points
         )
 
         # Normalize data to min and max on gt
-        min_depoint = min_gt.view(rebuild_points.shape[0], 1, 1)
-        max_depoint = max_gt.view(rebuild_points.shape[0], 1, 1)
+        min_depoint = min_gt.to(device).view(rebuild_points.shape[0], 1, 1)
+        max_depoint = max_gt.to(device).view(rebuild_points.shape[0], 1, 1)
 
         Npoints = torch.div(
             torch.subtract(De_point, min_depoint),

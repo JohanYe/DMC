@@ -4,6 +4,7 @@ from torch.nn import functional as F
 import os
 import json
 import numpy as np
+import warnings
 from tools import builder
 from utils import misc, dist_utils
 import time
@@ -17,6 +18,36 @@ from collections import defaultdict
 from SAP.src.utils import *
 import trimesh
 from datetime import datetime
+from tqdm import tqdm
+
+# Suppress pkg_resources deprecation warnings from torch
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="torch.utils.cpp_extension"
+)
+# Suppress torch.meshgrid indexing argument warning
+warnings.filterwarnings("ignore", message="torch.meshgrid: in an upcoming release")
+
+
+def calibrate_batchnorm(model, dataloader, num_batches=100):
+    model.train()  # BatchNorm needs train mode to update running stats
+    with torch.no_grad():
+        for idx, batch in enumerate(dataloader):
+            if idx >= num_batches:
+                break
+            # Just forward pass, no backward
+            (
+                _,
+                _,
+                data,
+                data_partial,
+                value_centroid,
+                value_std_pc,
+                _,
+                min_gt,
+                max_gt,
+            ) = batch
+            partial = data_partial.cuda()
+            _ = model(partial, min_gt, max_gt, value_std_pc, value_centroid)
 
 
 def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
@@ -37,16 +68,16 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
     start_epoch = 0
     best_metrics = None
     metrics = None
-    state_dict = dict()
-    metric_val_best = state_dict.get("loss_val_best", np.inf)
 
     # resume ckpts
-    # i should change this part.
     if args.resume:
-        start_epoch, best_metrics = builder.resume_model(
+        start_epoch, best_metrics_dict = builder.resume_model(
             base_model, args, logger=logger
         )
-        best_metrics = Metrics(config.consider_metric, best_metrics)
+        if best_metrics_dict is not None:
+            best_metrics = Metrics(config.consider_metric, best_metrics_dict)
+        else:
+            best_metrics = None
     elif args.start_ckpts is not None:
         builder.load_model(base_model, args.start_ckpts, logger=logger)
 
@@ -102,12 +133,14 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
         batch_start_time = time.time()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        # losses = AverageMeter(['SparseLoss', 'DenseLoss'])
         loss_each = {}
         num_iter = 0
         loss = 0
-        base_model.train()  # set model to training mode
+        base_model.train()
         n_batches = len(train_dataloader)
+
+        pbar = tqdm(enumerate(train_dataloader), total=n_batches, desc=f"Epoch {epoch}")
+
         for idx, (
             _,
             _,
@@ -118,8 +151,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             shell_grid_gt,
             min_gt,
             max_gt,
-        ) in enumerate(train_dataloader):
-            # optimizer.zero_grad()
+        ) in pbar:
             data_time.update(time.time() - batch_start_time)
             npoints = config.dataset.train._base_.N_POINTS
             dataset_name = config.dataset.train._base_.NAME
@@ -133,32 +165,42 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
 
             num_iter += 1
 
-            # slows down training a lot
-            # torch.autograd.set_detect_anomaly(True)
             psr_grid, point_r = base_model(
                 partial, min_gt, max_gt, value_std_pc, value_centroid
             )
             psr_grid = torch.tanh(torch.clamp(psr_grid, -10, 10))
             gt_psr = torch.tanh(torch.clamp(gt_psr, -10, 10))
-            # loss_each = {}
-            #
-            loss_chamfer = base_model.module.get_loss(point_r, gt)
-            # loss_chamfer, _ = chamfer_distance(point_r, gt)
 
+            loss_chamfer = base_model.module.get_loss(point_r, gt)
             loss_mse = criterion(psr_grid, gt_psr)
             loss = loss_mse + loss_chamfer
-            loss = loss / config.step_per_update
 
-            loss.backward()
-            # optimizer.step()
+            # Save point cloud for visualization
+            if idx == 0:
+                vis_dir = os.path.join(args.experiment_path, "vis")
+                os.makedirs(vis_dir, exist_ok=True)
+                pred_points = (
+                    point_r[0].detach().cpu().numpy() * value_std_pc.numpy()
+                ) + value_centroid.numpy()
+                trimesh.PointCloud(pred_points).export(
+                    f"./vis/epoch{epoch:03d}_train_sample{idx}_pred.ply"
+                )
 
-            # forward
+            # Update progress bar with individual losses
+            pbar.set_postfix(
+                {
+                    "loss_mse": loss_mse.item(),
+                    "loss_chamfer": loss_chamfer.item(),
+                    "total_loss": loss.item(),
+                }
+            )
+
             if num_iter == config.step_per_update:
                 num_iter = 0
                 torch.nn.utils.clip_grad_norm_(base_model.parameters(), max_norm=1.0)
                 optimizer.step()
                 base_model.zero_grad()
-            logger.info("loss metric : %.4f" % (loss))
+
             n_itr = epoch * n_batches + idx
             if train_writer is not None:
                 train_writer.add_scalar("train/itr", loss, n_itr)
@@ -166,8 +208,11 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
 
-        if loss_each is not None:
-            # print_log((' loss_%s=%.4f') % (k, l.item()),logger = logger)
+            if idx == 5 and args.debug is True:
+                break
+
+        # Print per-epoch statistics
+        if train_writer is not None:
             train_writer.add_scalar("train/epoch", loss, epoch)
 
         if isinstance(scheduler, list):
@@ -178,6 +223,13 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
         epoch_end_time = time.time()
 
         if epoch % args.val_freq == 0 and epoch != 0:
+            print_log("Calibrating BatchNorm statistics...", logger=logger)
+            calibrate_batchnorm(base_model.module, train_dataloader, num_batches=100)
+
+            # Sync BatchNorm stats across processes if using SyncBatchNorm
+            if args.distributed:
+                torch.distributed.barrier()
+
             # Validate the current model
             metrics = validate(
                 base_model,
@@ -191,16 +243,16 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
                 logger=logger,
             )
 
-            # Save ckeckpoints
-            if -(metrics - metric_val_best) >= 0:
-                metric_val_best = metrics
-                logger.info("New best model (loss %.4f)" % metric_val_best)
+            # Save checkpoints
+            if best_metrics is None or metrics < best_metrics:
+                best_metrics = metrics
+                logger.info("New best model (loss %.4f)" % metrics)
                 builder.save_checkpoint(
                     base_model,
                     optimizer,
                     epoch,
                     metrics,
-                    metric_val_best,
+                    best_metrics,
                     "ckpt-best",
                     args,
                     logger=logger,
@@ -210,7 +262,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             optimizer,
             epoch,
             metrics,
-            metric_val_best,
+            best_metrics,
             "ckpt-last",
             args,
             logger=logger,
@@ -221,13 +273,17 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
                 optimizer,
                 epoch,
                 metrics,
-                metric_val_best,
+                best_metrics,
                 f"ckpt-epoch-{epoch:03d}",
                 args,
                 logger=logger,
             )
-    train_writer.close()
-    val_writer.close()
+
+    # Only close writers on rank 0
+    if train_writer is not None:
+        train_writer.close()
+    if val_writer is not None:
+        val_writer.close()
 
 
 def validate(
@@ -242,14 +298,20 @@ def validate(
     logger=None,
 ):
     print_log(f"[VALIDATION] Start validating epoch {epoch}", logger=logger)
-    base_model.eval()  # set model to eval mode
+    base_model.eval()
     eval_list = defaultdict(list)
     eval_step_dict = {}
     eval_dict = {}
     category_metrics = dict()
-    n_samples = len(test_dataloader)  # bs is 1
+    n_samples = len(test_dataloader)
 
     with torch.no_grad():
+        pbar = tqdm(
+            enumerate(test_dataloader),
+            total=n_samples,
+            desc=f"Validating Epoch {epoch}",
+        )
+
         for idx, (
             taxonomy_ids,
             model_ids,
@@ -260,7 +322,7 @@ def validate(
             shell_grid_gt,
             min_gt,
             max_gt,
-        ) in enumerate(test_dataloader):
+        ) in pbar:
             taxonomy_id = (
                 taxonomy_ids[0]
                 if isinstance(taxonomy_ids[0], str)
@@ -279,27 +341,35 @@ def validate(
             psr_grid, point_r = base_model(
                 partial, min_gt, max_gt, value_std_pc, value_centroid
             )
-            # print("psr_grid_valid", psr_grid)
-            # print("point_r_valid", point_r)
+
+            # Save point cloud for visualization
+            if idx == 0:
+                vis_dir = os.path.join(args.experiment_path, "vis")
+                os.makedirs(vis_dir, exist_ok=True)
+                pred_points = (
+                    point_r[0].cpu().numpy() * value_std_pc.numpy()
+                ) + value_centroid.numpy()
+                trimesh.PointCloud(pred_points).export(
+                    f"./vis/epoch{epoch:03d}_validation_sample{idx}_pred.ply"
+                )
 
             psr_grid = torch.tanh(torch.clamp(psr_grid, -10, 10))
             gt_psr = torch.tanh(torch.clamp(gt_psr, -10, 10))
             loss_chamfer = base_model.module.get_loss(point_r, gt)
-            # loss_chamfer, _ = chamfer_distance(point_r, gt)
-
             loss_mse = criterion(psr_grid, gt_psr)
             loss = loss_mse + loss_chamfer
-            eval_step_dict["psr_l1"] = loss_chamfer.cpu()
-            eval_step_dict["psr_l2"] = loss_mse.cpu()
-            # print(loss_chamfer.cpu())
-            # print(loss_mse.cpu())
+
+            eval_step_dict["psr_l1"] = loss_chamfer.cpu().item()
+            eval_step_dict["psr_l2"] = loss_mse.cpu().item()
             for k, v in eval_step_dict.items():
                 eval_list[k].append(v)
 
             eval_dict = {k: np.mean(v) for k, v in eval_list.items()}
 
-            metric_val = eval_dict["psr_l2"]
-            logger.info("Validation metric : %.4f" % (metric_val))
+            # Update progress bar with current losses
+            pbar.set_postfix(
+                {"loss_mse": loss_mse.item(), "loss_chamfer": loss_chamfer.item()}
+            )
 
             if val_writer is not None:
                 val_writer.add_scalar(
@@ -316,7 +386,6 @@ def validate(
                 vis_dir = os.path.join(args.experiment_path, "vis")
                 os.makedirs(vis_dir, exist_ok=True)
 
-                # Denormalize points
                 pred_points = (
                     point_r[0].cpu().numpy() * value_std_pc.numpy()
                 ) + value_centroid.numpy()
@@ -324,7 +393,6 @@ def validate(
                     gt[0].cpu().numpy() * value_std_pc.numpy()
                 ) + value_centroid.numpy()
 
-                # Save as PLY
                 trimesh.PointCloud(pred_points).export(
                     os.path.join(vis_dir, f"epoch{epoch:03d}_sample{idx}_pred.ply")
                 )
@@ -332,11 +400,20 @@ def validate(
                     os.path.join(vis_dir, f"epoch{epoch:03d}_sample{idx}_gt.ply")
                 )
 
+            if idx == 5 and args.debug is True:
+                break
+
+    # Print per-epoch validation statistics
+    print_log(
+        f"[VALIDATION] Epoch {epoch} - MSE: {eval_dict['psr_l2']:.4f}, L1: {eval_dict['psr_l1']:.4f}",
+        logger=logger,
+    )
+
     if val_writer is not None:
         val_writer.add_scalar("Valid/epoch_loss_mse", eval_dict["psr_l2"], epoch)
         val_writer.add_scalar("Valid/epoch_loss_chamfer", eval_dict["psr_l1"], epoch)
 
-    return metric_val
+    return eval_dict["psr_l2"]
 
 
 def test_net(args, config):
