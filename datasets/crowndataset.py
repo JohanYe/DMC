@@ -43,20 +43,10 @@ class crown(data.Dataset):
             )
         self.dpsr = DPSR(res=(128, 128, 128), sig=2)
 
-    def _compute_psr_for_sample(self, shell_points, shell_normals):
-        """Compute PSR grid from already mean/std normalized shell points"""
-        verts = shell_points.astype(np.float32)
-        norms = shell_normals.astype(np.float32)
-
-        # Scale normalized points to [0.1, 0.9] for DPSR
-        verts_min = verts.min(axis=0)
-        verts_max = verts.max(axis=0)
-        verts_01 = (verts - verts_min) / (verts_max - verts_min + 1e-8)
-        verts_01 = verts_01 * 0.8 + 0.1
-
-        points = torch.from_numpy(verts_01).float().unsqueeze(0)
-        normals = torch.from_numpy(norms).float().unsqueeze(0)
-
+    def _compute_psr_for_sample(self, shell_points_01, shell_normals):
+        """Compute PSR grid from [0,1] normalized points"""
+        points = torch.from_numpy(shell_points_01.astype(np.float32)).unsqueeze(0)
+        normals = torch.from_numpy(shell_normals.astype(np.float32)).unsqueeze(0)
         with torch.no_grad():
             psr_grid = self.dpsr(points, normals)
         return psr_grid.squeeze().numpy()
@@ -158,9 +148,7 @@ class crown(data.Dataset):
             mesh.compute_vertex_normals()  # in case normals aren't stored in the file
             shell_points = np.asarray(mesh.vertices)
             shell_normals = np.asarray(mesh.vertex_normals)
-            # fps_index = fpsample.bucket_fps_kdline_sampling(
-            #     shell_points, 3000, h=5
-            # )
+            # fps_index = fpsample.bucket_fps_kdline_sampling(shell_points, 3000, h=5)
             # shell_points = shell_points[fps_index]
             # shell_normals = shell_normals[fps_index]
             shell = o3d.geometry.PointCloud()
@@ -169,13 +157,9 @@ class crown(data.Dataset):
             self.file_list[idx]["shell_pc"] = shell
 
         shellP = np.asarray(shell.points)
+        shell_normals_original = np.asarray(shell.normals).copy()  # Add this line
         shell_min = np.min(shellP)
         shell_max = np.max(shellP)
-
-        shell_grid = self.file_list[idx].get("psr_grid")
-        if shell_grid is None:
-            shell_grid = self._compute_psr_for_sample(shellP, np.asarray(shell.normals))
-            self.file_list[idx]["psr_grid"] = shell_grid
 
         # normalize
         main_only, opposing_only, shell = (
@@ -186,7 +170,13 @@ class crown(data.Dataset):
         main_only, opposing_only, shell, centroid, std_pc = (
             self.normalize_points_mean_std(main_only, opposing_only, shell)
         )
-
+        shell_grid = self.file_list[idx].get("psr_grid")
+        if shell_grid is None:
+            shell_points_01 = (shellP - shell_min) / (shell_max + 1 - shell_min)
+            shell_grid = self._compute_psr_for_sample(
+                shell_points_01, shell_normals_original
+            )
+            self.file_list[idx]["psr_grid"] = shell_grid
         """""
         # sample from main
         patch_size_main = 5120
