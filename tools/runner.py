@@ -53,6 +53,28 @@ def calibrate_batchnorm(model, dataloader, num_batches=100):
 def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
     print("Training Start.......")
     logger = get_logger(args.log_name)
+
+    # Create output directory structure for this run
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    run_output_dir = os.path.join(
+        args.experiment_path, "outputs", f"{args.exp_name}_{timestamp}"
+    )
+    # Only rank 0 creates directories
+    if args.local_rank == 0:
+        vis_dir = os.path.join(run_output_dir, "visualizations")
+        pred_dir = os.path.join(run_output_dir, "predictions")
+        mesh_dir = os.path.join(run_output_dir, "meshes")
+        ckpt_dir = os.path.join(run_output_dir, "checkpoints")
+        os.makedirs(vis_dir, exist_ok=True)
+        os.makedirs(pred_dir, exist_ok=True)
+        os.makedirs(mesh_dir, exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+    if args.distributed:
+        torch.distributed.barrier()
+
+    print_log(f"Output directory: {run_output_dir}", logger=logger)
+
     # build dataset
     (train_sampler, train_dataloader), (_, test_dataloader) = builder.dataset_builder(
         args, config.dataset.train
@@ -165,6 +187,8 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
 
             num_iter += 1
 
+            # debug stuff
+            # with torch.no_grad():
             psr_grid, point_r = base_model(
                 partial, min_gt, max_gt, value_std_pc, value_centroid
             )
@@ -174,16 +198,17 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             loss_chamfer = base_model.module.get_loss(point_r, gt)
             loss_mse = criterion(psr_grid, gt_psr)
             loss = loss_mse + loss_chamfer
+            loss.backward()
 
-            # Save point cloud for visualization
-            if idx == 0:
-                vis_dir = os.path.join(args.experiment_path, "vis")
-                os.makedirs(vis_dir, exist_ok=True)
+            # Save point cloud for visualization (rank 0 only)
+            if idx == 0 and args.local_rank == 0:
                 pred_points = (
                     point_r[0].detach().cpu().numpy() * value_std_pc.numpy()
                 ) + value_centroid.numpy()
                 trimesh.PointCloud(pred_points).export(
-                    f"./vis/epoch{epoch:03d}_train_sample{idx}_pred.ply"
+                    os.path.join(
+                        vis_dir, f"epoch{epoch:03d}_train_sample{idx}_pred.ply"
+                    )
                 )
 
             # Update progress bar with individual losses
@@ -223,8 +248,8 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
         epoch_end_time = time.time()
 
         if epoch % args.val_freq == 0 and epoch != 0:
-            print_log("Calibrating BatchNorm statistics...", logger=logger)
-            calibrate_batchnorm(base_model.module, train_dataloader, num_batches=100)
+            # print_log("Calibrating BatchNorm statistics...", logger=logger)
+            # calibrate_batchnorm(base_model.module, train_dataloader, num_batches=100)
 
             # Sync BatchNorm stats across processes if using SyncBatchNorm
             if args.distributed:
@@ -241,6 +266,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
                 config,
                 config_SAP,
                 logger=logger,
+                run_output_dir=run_output_dir,
             )
 
             # Save checkpoints
@@ -256,6 +282,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
                     "ckpt-best",
                     args,
                     logger=logger,
+                    save_dir=ckpt_dir,
                 )
         builder.save_checkpoint(
             base_model,
@@ -266,6 +293,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
             "ckpt-last",
             args,
             logger=logger,
+            save_dir=ckpt_dir,
         )
         if (config.max_epoch - epoch) < 10:
             builder.save_checkpoint(
@@ -277,6 +305,7 @@ def run_net(args, config, config_SAP, train_writer=None, val_writer=None):
                 f"ckpt-epoch-{epoch:03d}",
                 args,
                 logger=logger,
+                save_dir=ckpt_dir,
             )
 
     # Only close writers on rank 0
@@ -296,6 +325,7 @@ def validate(
     config,
     config_SAP,
     logger=None,
+    run_output_dir=None,
 ):
     print_log(f"[VALIDATION] Start validating epoch {epoch}", logger=logger)
     base_model.eval()
@@ -305,11 +335,32 @@ def validate(
     category_metrics = dict()
     n_samples = len(test_dataloader)
 
+    # Create output directories if not already passed (rank 0 only)
+    if args.local_rank == 0:
+        if run_output_dir is None:
+            timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+            run_output_dir = os.path.join(
+                args.experiment_path, "outputs", f"{args.exp_name}_{timestamp}"
+            )
+        vis_dir = os.path.join(run_output_dir, "visualizations")
+        mesh_dir = os.path.join(run_output_dir, "meshes")
+        os.makedirs(vis_dir, exist_ok=True)
+        os.makedirs(mesh_dir, exist_ok=True)
+
+    if args.distributed:
+        torch.distributed.barrier()
+
+    threshold = 0  # for mesh generation
+
     with torch.no_grad():
-        pbar = tqdm(
-            enumerate(test_dataloader),
-            total=n_samples,
-            desc=f"Validating Epoch {epoch}",
+        pbar = (
+            tqdm(
+                enumerate(test_dataloader),
+                total=n_samples,
+                desc=f"Validating Epoch {epoch}",
+            )
+            if args.local_rank == 0
+            else enumerate(test_dataloader)
         )
 
         for idx, (
@@ -342,15 +393,15 @@ def validate(
                 partial, min_gt, max_gt, value_std_pc, value_centroid
             )
 
-            # Save point cloud for visualization
-            if idx == 0:
-                vis_dir = os.path.join(args.experiment_path, "vis")
-                os.makedirs(vis_dir, exist_ok=True)
+            # Save point cloud for visualization (rank 0 only)
+            if idx == 0 and args.local_rank == 0:
                 pred_points = (
                     point_r[0].cpu().numpy() * value_std_pc.numpy()
                 ) + value_centroid.numpy()
                 trimesh.PointCloud(pred_points).export(
-                    f"./vis/epoch{epoch:03d}_validation_sample{idx}_pred.ply"
+                    os.path.join(
+                        vis_dir, f"epoch{epoch:03d}_validation_sample{idx}_pred.ply"
+                    )
                 )
 
             psr_grid = torch.tanh(torch.clamp(psr_grid, -10, 10))
@@ -367,11 +418,12 @@ def validate(
             eval_dict = {k: np.mean(v) for k, v in eval_list.items()}
 
             # Update progress bar with current losses
-            pbar.set_postfix(
-                {"loss_mse": loss_mse.item(), "loss_chamfer": loss_chamfer.item()}
-            )
+            if isinstance(pbar, tqdm):
+                pbar.set_postfix(
+                    {"loss_mse": loss_mse.item(), "loss_chamfer": loss_chamfer.item()}
+                )
 
-            if val_writer is not None:
+            if val_writer is not None and args.local_rank == 0:
                 val_writer.add_scalar(
                     "Valid/loss_chamfer", loss_chamfer.item(), epoch * n_samples + idx
                 )
@@ -382,10 +434,7 @@ def validate(
                     "Valid/total_loss", loss.item(), epoch * n_samples + idx
                 )
 
-            if idx < 3:
-                vis_dir = os.path.join(args.experiment_path, "vis")
-                os.makedirs(vis_dir, exist_ok=True)
-
+            if idx < 3 and args.local_rank == 0:
                 pred_points = (
                     point_r[0].cpu().numpy() * value_std_pc.numpy()
                 ) + value_centroid.numpy()
@@ -400,18 +449,32 @@ def validate(
                     os.path.join(vis_dir, f"epoch{epoch:03d}_sample{idx}_gt.ply")
                 )
 
+                # Generate and save mesh
+                v, f, _ = mc_from_psr(psr_grid, zero_level=threshold)
+                mesh_out_file = os.path.join(
+                    mesh_dir, f"epoch{epoch:03d}_sample{idx}_pred.ply"
+                )
+                export_mesh(mesh_out_file, v, f)
+
             if idx == 5 and args.debug is True:
                 break
 
-    # Print per-epoch validation statistics
-    print_log(
-        f"[VALIDATION] Epoch {epoch} - MSE: {eval_dict['psr_l2']:.4f}, L1: {eval_dict['psr_l1']:.4f}",
-        logger=logger,
-    )
+    # Synchronize metrics across all ranks
+    if args.distributed:
+        torch.distributed.barrier()
 
-    if val_writer is not None:
-        val_writer.add_scalar("Valid/epoch_loss_mse", eval_dict["psr_l2"], epoch)
-        val_writer.add_scalar("Valid/epoch_loss_chamfer", eval_dict["psr_l1"], epoch)
+    # Print per-epoch validation statistics
+    if args.local_rank == 0:
+        print_log(
+            f"[VALIDATION] Epoch {epoch} - MSE: {eval_dict['psr_l2']:.4f}, L1: {eval_dict['psr_l1']:.4f}",
+            logger=logger,
+        )
+
+        if val_writer is not None:
+            val_writer.add_scalar("Valid/epoch_loss_mse", eval_dict["psr_l2"], epoch)
+            val_writer.add_scalar(
+                "Valid/epoch_loss_chamfer", eval_dict["psr_l1"], epoch
+            )
 
     return eval_dict["psr_l2"]
 
@@ -419,6 +482,13 @@ def validate(
 def test_net(args, config):
     logger = get_logger(args.log_name)
     print_log("Tester start ... ", logger=logger)
+
+    # Create output directory structure for this run
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    run_output_dir = os.path.join(
+        args.experiment_path, "outputs", f"{args.exp_name}_{timestamp}"
+    )
+
     _, test_dataloader = builder.dataset_builder(args, config.dataset.test)
 
     base_model = builder.model_builder(config.model)
@@ -444,25 +514,43 @@ def test_net(args, config):
         args,
         config,
         logger=logger,
+        run_output_dir=run_output_dir,
     )
 
 
 def test(
-    base_model, test_dataloader, ChamferDisL1, ChamferDisL2, args, config, logger=None
+    base_model,
+    test_dataloader,
+    ChamferDisL1,
+    ChamferDisL2,
+    args,
+    config,
+    logger=None,
+    run_output_dir=None,
 ):
-    base_model.eval()  # set model to eval mode
-    # use_cuda = not args.no_cuda and torch.cuda.is_available()
-    # device = torch.device("cuda" if use_cuda else "cpu")
-    # generator = get_generator(model_sap, config_SAP, device=device)
-    # dpsr = DPSR(res=(128, 128, 128), sig=2)
-    # test_losses = AverageMeter(['SparseLossL1', 'SparseLossL2', 'DenseLossL1', 'DenseLossL2'])
+    base_model.eval()
+
+    # Create output directories for test run (rank 0 only)
+    if run_output_dir is None:
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        run_output_dir = os.path.join(
+            args.experiment_path, "outputs", f"{args.exp_name}_{timestamp}"
+        )
+    pred_dir = os.path.join(run_output_dir, "predictions")
+    mesh_dir = os.path.join(run_output_dir, "meshes")
+    if args.local_rank == 0:
+        os.makedirs(pred_dir, exist_ok=True)
+        os.makedirs(mesh_dir, exist_ok=True)
+
+    if args.distributed:
+        torch.distributed.barrier()
+
     threshold = 0
     eval_list = defaultdict(list)
     eval_step_dict = {}
     eval_dict = {}
-    # test_metrics = AverageMeter(Metrics.names())
     category_metrics = dict()
-    n_samples = len(test_dataloader)  # bs is 1
+    n_samples = len(test_dataloader)
     print("Generating...")
     with torch.no_grad():
         for idx, (
@@ -508,12 +596,14 @@ def test(
                 dense_points = (
                     torch.multiply(dense_points[0].cpu(), value_std_pc) + value_centroid
                 )
-                np.save(
-                    os.path.join(point_dir, str(model_id) + "pred.npy"),
-                    dense_points.cpu().numpy(),
-                )
-                pc = trimesh.PointCloud(dense_points.cpu().numpy())
-                pc.export(os.path.join(point_dir, str(model_id) + "pred.ply"))
+                # Save predictions (rank 0 only)
+                if args.local_rank == 0:
+                    np.save(
+                        os.path.join(pred_dir, str(model_id) + "_pred.npy"),
+                        dense_points.cpu().numpy(),
+                    )
+                    pc = trimesh.PointCloud(dense_points.cpu().numpy())
+                    pc.export(os.path.join(pred_dir, str(model_id) + "_pred.ply"))
 
                 min_gt = dense_points.min()
                 max_gt = dense_points.max()
@@ -537,15 +627,14 @@ def test(
                     points.cpu().numpy() * (max_depoint + 1 - min_depoint) + min_depoint
                 )
 
-                # Write output
-                mesh_dir = "./af"
-                mesh_out_file = os.path.join(mesh_dir, str(model_id) + ".ply")
-                export_mesh(mesh_out_file, de_p, f)
-                # write point cloud
-
-                np.save(
-                    os.path.join(point_dir, str(model_id) + "predsap.npy"), de_point
-                )
+                # Write output (rank 0 only)
+                if args.local_rank == 0:
+                    mesh_out_file = os.path.join(mesh_dir, str(model_id) + ".ply")
+                    export_mesh(mesh_out_file, de_p, f)
+                    # write point cloud
+                    np.save(
+                        os.path.join(pred_dir, str(model_id) + "_predsap.npy"), de_point
+                    )
                 loss_chamfer_l1 = ChamferDisL1(point_r, gt)
                 loss_chamfer_l2 = ChamferDisL2(point_r, gt)
                 # loss_chamfer = base_model.get_loss(point_r, gt)

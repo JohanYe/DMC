@@ -148,9 +148,12 @@ def resume_optimizer(optimizer, args, logger=None):
 
 
 def save_checkpoint(
-    base_model, optimizer, epoch, metrics, best_metrics, prefix, args, logger=None
+    base_model, optimizer, epoch, metrics, best_metrics, prefix, args, logger=None, save_dir=None
 ):
     if args.local_rank == 0:
+        if save_dir is None:
+            save_dir = args.experiment_path
+        ckpt_path = os.path.join(save_dir, prefix + ".pth")
         torch.save(
             {
                 "base_model": (
@@ -163,10 +166,10 @@ def save_checkpoint(
                 "metrics": metrics if metrics is not None else dict(),
                 "best_metrics": best_metrics,
             },
-            os.path.join(args.experiment_path, prefix + ".pth"),
+            ckpt_path,
         )
         print_log(
-            f"Save checkpoint at {os.path.join(args.experiment_path, prefix + '.pth')}",
+            f"Save checkpoint at {ckpt_path}",
             logger=logger,
         )
 
