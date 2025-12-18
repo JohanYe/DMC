@@ -1,3 +1,9 @@
+import warnings
+
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="torch.utils.cpp_extension"
+)
+
 from tools import run_net
 from tools import test_net
 from utils import parser, dist_utils, misc
@@ -17,29 +23,41 @@ def main():
     args.config = "cfgs/Tooth_models/PoinTr.yaml"
     args.config_SAP = "SAP/configs/learning_based/noise_small/ours.yaml"
     # args.test = 'true'
-    # args.ckpts = "./pretrained/ckpt-last.pth"
+    # args.resume = True
+    # args.ckpts = (
+    #     "/nfshome/joye/DMC/experiments/PoinTr/Tooth_models/default/ckpt-last.pth"
+    # )
     # args.mode ="easy"
-    args.exp_name = "train-20-03-23"
+    args.exp_name = "baseline"
+    args.debug = False
 
     # CUDA
     args.use_gpu = torch.cuda.is_available()
     if args.use_gpu:
         torch.backends.cudnn.benchmark = True
+
+    # Auto-detect distributed mode from torchrun environment
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        args.launcher = "pytorch"
+
     # init distributed env first, since logger depends on the dist info.
     if args.launcher == "none":
         args.distributed = False
+        args.local_rank = 0
     else:
         args.distributed = True
         dist_utils.init_dist(args.launcher)
         # re-set gpu_ids with distributed training mode
+        args.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         _, world_size = dist_utils.get_dist_info()
         args.world_size = world_size
     print("in the main function")
+
     # logger
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     log_file = os.path.join(args.experiment_path, f"{timestamp}.log")
     logger = get_root_logger(log_file=log_file, name=args.log_name)
-    # define the tensorboard writer
+    # define the tensorboard writer (rank 0 only to avoid race condition)
     if not args.test:
         if args.local_rank == 0:
             train_writer = SummaryWriter(
@@ -51,6 +69,10 @@ def main():
         else:
             train_writer = None
             val_writer = None
+
+    # Synchronize all ranks after writers are created
+    if args.distributed:
+        torch.distributed.barrier()
     # config
     config = get_config(args, logger=logger)
     config_SAP = load_config(args.config_SAP)
