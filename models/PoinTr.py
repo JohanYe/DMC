@@ -47,20 +47,20 @@ class Fold(nn.Module):
 
         self.folding1 = nn.Sequential(
             nn.Conv1d(in_channel + 2, hidden_dim, 1),
-            nn.BatchNorm1d(hidden_dim),
+            # nn.GroupNorm(1, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            nn.BatchNorm1d(hidden_dim // 2),
+            # nn.GroupNorm(1, hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim // 2, 3, 1),
         )
 
         self.folding2 = nn.Sequential(
             nn.Conv1d(in_channel + 3, hidden_dim, 1),
-            nn.BatchNorm1d(hidden_dim),
+            # nn.GroupNorm(1, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim, hidden_dim // 2, 1),
-            nn.BatchNorm1d(hidden_dim // 2),
+            # nn.GroupNorm(1, hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Conv1d(hidden_dim // 2, 3, 1),
         )
@@ -113,16 +113,16 @@ class PoinTr(nn.Module):
 
         self.increase_dim = nn.Sequential(
             nn.Conv1d(self.trans_dim, 1024, 1),
-            nn.BatchNorm1d(1024),
+            nn.GroupNorm(8, 1024),
             nn.LeakyReLU(negative_slope=0.2),
             nn.Conv1d(1024, 1024, 1),
         )
         self.reduce_map = nn.Linear(self.trans_dim + 1027, self.trans_dim)
         self.build_loss_func()
 
-        for module in self.modules():
-            if isinstance(module, nn.BatchNorm1d):
-                module.momentum = 0.01
+        # for module in self.modules():
+        #     if isinstance(module, nn.BatchNorm1d):
+        #         module.momentum = 0.01
 
     def build_loss_func(self):
         self.loss_func = ChamferDistanceL1()
